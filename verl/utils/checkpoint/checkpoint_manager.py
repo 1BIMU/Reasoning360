@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.distributed
 from omegaconf import DictConfig
-from transformers import PreTrainedTokenizer, ProcessorMixin
+from transformers import PreTrainedTokenizer
 
 from verl.utils.device import get_device_name, get_torch_device
 
@@ -47,7 +47,7 @@ class BaseCheckpointManager:
         model,
         optimizer: torch.optim.Optimizer,
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
-        processing_class: PreTrainedTokenizer | ProcessorMixin = None,
+        processing_class: PreTrainedTokenizer = None,
         checkpoint_config: DictConfig = None,
     ):
         self.checkpoint_config = checkpoint_config
