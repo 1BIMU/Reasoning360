@@ -35,7 +35,10 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+import torch.nn.functional as F
 
+
+from verl.utils import torch_functional as verl_F
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -215,80 +218,59 @@ def compute_response_mask(data: DataProto):
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
-    gamma: float = 1.0,
+    gamma: float = 1.0, # gamma 和 lam 不再被使用，但保留签名以防万一
     lam: float = 1.0,
     num_repeat: int = 1,
-    norm_adv_by_std_in_grpo: bool = True,
+    norm_adv_by_std_in_grpo: bool = True, # 不再使用
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
-    """Compute advantage estimates for policy optimization.
-
-    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
-    The advantage estimates are used to guide policy optimization in RL algorithms.
-
-    Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
-        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
-        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
-        num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
-        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
-            GRPO. Defaults to True.
-        config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
-
-    Returns:
-        DataProto: The updated data with computed advantages and returns.
     """
-    # Back-compatible with trainers that do not compute response mask in fit
+    【重大修改】
+    不再使用 GAE (L235-L311)。
+    使用序列级别的 Advantage A = R_real - V(prompt)。
+
+    假设:
+    1. data.batch["R_real"] 存放真实的0/1回报 (形状 [batch_size])
+    2. data.batch["values"] 存放 V(prompt) 的 logits (形状 [batch_size, 1])
+    """
+    
+    # 1. 获取真实回报 R_real
+    #    R_real 由 reward_fn (在 fit 循环中) 计算得出
+    R_real = data.batch["R_real"] # 形状 [batch_size]
+
+    # 2. 获取 V(prompt) 的预测概率
+    #    values 由 critic_wg.compute_values (在 fit 循环中) 计算得出
+    #    【关键】必须 .detach()！Advantage 的计算不能让梯度流回 Critic
+    with torch.no_grad():
+        V_pred_logits = data.batch["values"] # 形状 [batch_size, 1]
+        V_pred_prob = torch.sigmoid(V_pred_logits.squeeze(-1)) # 形状 [batch_size]
+
+    # 3. 计算序列级别的 Advantage (A = R - V)
+    #    形状 [batch_size]
+    A_seq_level = R_real.float() - V_pred_prob
+
+    # 4. 获取 response_mask
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
-    # prepare response group
-    if adv_estimator == AdvantageEstimator.GAE:
-        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
-        advantages, returns = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["token_level_rewards"],
-            values=data.batch["values"],
-            response_mask=data.batch["response_mask"],
-            gamma=gamma,
-            lam=lam,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-        if config.get("use_pf_ppo", False):
-            data = core_algos.compute_pf_ppo_reweight_data(
-                data,
-                config.pf_ppo.reweight_method,
-                config.pf_ppo.weight_pow,
-            )
-    elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch["response_mask"]
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-    else:
-        # handle all other adv estimator type other than GAE and GRPO
-        adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
-        adv_kwargs = {
-            "token_level_rewards": data.batch["token_level_rewards"],
-            "response_mask": data.batch["response_mask"],
-            "config": config,
-        }
-        if "uid" in data.non_tensor_batch:  # optional
-            adv_kwargs["index"] = data.non_tensor_batch["uid"]
-        if "reward_baselines" in data.batch:  # optional
-            adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+    response_mask = data.batch["response_mask"] # 形状 [batch_size, seq_len]
+    
+    # 5. 将序列 A 广播 (Tile) 到所有 token
+    #    A_seq_level.unsqueeze(-1) -> [batch_size, 1]
+    #    .expand_as(response_mask) -> [batch_size, seq_len]
+    advantages_token_level = A_seq_level.unsqueeze(-1).expand_as(response_mask)
+    
+    # 6. PPO Actor Loss 会使用 response_mask，但我们先手动 mask 一下
+    advantages_token_level = advantages_token_level * response_mask
 
-        # calculate advantage estimator
-        advantages, returns = adv_estimator_fn(**adv_kwargs)
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
+    # 7. 白化 (Whiten) Advantage 是稳定 PPO 训练的关键步骤
+    advantages_token_level = verl_F.masked_whiten(advantages_token_level, response_mask)
+
+    # 8. 存入 batch，供 Actor 更新使用
+    data.batch["advantages"] = advantages_token_level
+
+    # 9. 【删除】不再需要 "returns" 字段，PPO Actor Loss 只用 advantages
+    #    我们的新 Critic Loss 用的是 R_real
+    
     return data
 
 
@@ -1311,19 +1293,10 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        batch.batch["R_real"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
 
@@ -1363,7 +1336,7 @@ class RayPPOTrainer:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            scores = batch.batch["R_real"].cpu().tolist()
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,

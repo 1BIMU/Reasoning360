@@ -22,6 +22,7 @@ import torch
 import torch.distributed
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn import BCEWithLogitsLoss
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
@@ -53,6 +54,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
+        self.critic_loss_fn = BCEWithLogitsLoss()
 
     def _forward_micro_batch(self, micro_batch):
         response_length = micro_batch["responses"].size(-1)
@@ -119,7 +121,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 # pad it back
                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
-                values = values[:, -response_length - 1 : -1]
+                values_logit = values[:, -response_length - 1].unsqueeze(-1) # 形状 [batch_size, 1]
             else:
                 output = self.critic_module(
                     input_ids=input_ids,
@@ -133,8 +135,9 @@ class DataParallelPPOCritic(BasePPOCritic):
                     values = output[2]
                 else:
                     values = output.logits
-                values = values[:, -response_length - 1 : -1].squeeze(-1)
-            return values
+                
+                values_logit = values[:, -response_length - 1, :] # 形状 [batch_size, 1]
+            return values_logit
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -160,7 +163,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         micro_batch_size = data.meta_info["micro_batch_size"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = ["responses", "input_ids", "response_mask", "attention_mask", "position_ids"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -175,8 +178,8 @@ class DataParallelPPOCritic(BasePPOCritic):
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                values = self._forward_micro_batch(model_inputs)
-            values_lst.append(values)
+                values_logit = self._forward_micro_batch(model_inputs)
+            values_lst.append(values_logit)
         values = torch.concat(values_lst, dim=0)
 
         if use_dynamic_bsz:
@@ -192,7 +195,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module.train()
         metrics = {}
 
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "R_real"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -218,18 +221,19 @@ class DataParallelPPOCritic(BasePPOCritic):
                 for micro_batch in micro_batches:
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
-                    values = model_inputs["values"]
-                    returns = model_inputs["returns"]
+                    
+                    # 【修改】获取 V(prompt) 的 logit 预测
+                    vpreds_logits = self._forward_micro_batch(model_inputs) # 形状 [batch_micro, 1]
+                    
+                    # 【修改】获取真实的 0/1 标签
+                    R_real_labels = model_inputs["R_real"] # 形状 [batch_micro]
 
-                    vpreds = self._forward_micro_batch(model_inputs)
-                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
-                        vpreds=vpreds,
-                        values=values,
-                        returns=returns,
-                        response_mask=response_mask,
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
+                    # 【修改】计算 BCE Loss
+                    # vpreds_logits.squeeze(-1) 变为 [batch_micro]
+                    # R_real_labels.float() 变为 [batch_micro]
+                    vf_loss = self.critic_loss_fn(
+                        vpreds_logits.squeeze(-1), 
+                        R_real_labels.float()      
                     )
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
@@ -239,11 +243,11 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     loss.backward()
 
+                    vpreds_prob = torch.sigmoid(vpreds_logits)
                     micro_batch_metrics.update(
                         {
                             "critic/vf_loss": vf_loss.detach().item(),
-                            "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                            "critic/vpred_prob_mean": vpreds_prob.mean().detach().item(),
                         }
                     )
 
@@ -254,3 +258,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                 append_to_dict(metrics, mini_batch_metrics)
         self.critic_optimizer.zero_grad()
         return metrics
+
+
+
+
